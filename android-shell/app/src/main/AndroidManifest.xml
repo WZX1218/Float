@@ -12,6 +12,9 @@
     <!-- 通话按住说话/语音条录音、视频通话摄像头（WebView getUserMedia 需要壳侧转授） -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 只有 API 26-28 需要：把网页导出的文件写进公共「下载」目录。
+         API 29+ 走 MediaStore，不需要任何存储权限。 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
