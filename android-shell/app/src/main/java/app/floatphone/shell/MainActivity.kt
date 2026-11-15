@@ -3,6 +3,7 @@ package app.floatphone.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,21 +12,30 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import java.io.File
+import java.io.IOException
 
 /**
  * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
@@ -34,14 +44,15 @@ import androidx.core.view.WindowCompat
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.0"
-        /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
+        const val VERSION = "1.1.0"
+        /** 来电接听等场景的站内深链（必须以当前站点地址开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    /** 站点地址弹窗同一时间只允许一个，避免加载失败时反复弹 */
+    private var siteDialogShowing = false
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -112,7 +123,7 @@ class MainActivity : AppCompatActivity() {
                 val scheme = url.scheme ?: return false
                 // 站内导航留在壳里；http(s) 外链和自定义协议（shortcuts:// 等）交给系统
                 if (scheme == "http" || scheme == "https") {
-                    if (url.host == Uri.parse(SITE_URL).host) return false
+                    if (url.host == ShellConfig.host(this@MainActivity)) return false
                     return runCatching {
                         startActivity(Intent(Intent.ACTION_VIEW, url)); true
                     }.getOrDefault(true)
@@ -120,6 +131,18 @@ class MainActivity : AppCompatActivity() {
                 return runCatching {
                     startActivity(Intent(Intent.ACTION_VIEW, url)); true
                 }.getOrDefault(true)
+            }
+
+            /**
+             * 站点打不开（换域名 / 被墙 / 服务挂）时给一次改地址的机会，
+             * 用户不必等新 APK 才能把壳救回来。
+             */
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (!request.isForMainFrame) return
+                promptSiteUrl(
+                    "打不开当前站点：${ShellConfig.get(this@MainActivity)}\n" +
+                        "如果换了域名或换了部署地址，可以在这里改；网络问题可以先取消。",
+                )
             }
         }
 
@@ -155,8 +178,9 @@ class MainActivity : AppCompatActivity() {
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
-                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
+                    // 兜底：网页没走 AndroidShell.saveFile（例如文件超过 24MB 的桥上限）。
+                    // WebView 自己不会把 blob 落盘，只有这一句提示，别让用户以为保存成功了。
+                    Toast.makeText(this, "文件较大，壳里没能直接保存，请在浏览器打开站点下载", Toast.LENGTH_LONG).show()
                     return@DownloadListener
                 }
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
@@ -180,7 +204,9 @@ class MainActivity : AppCompatActivity() {
         })
 
         // 冷启动带深链（如来电接听）直接加载目标；否则加载首页
-        webView.loadUrl(consumeOpenUrl(intent) ?: SITE_URL)
+        // 首次启动且编译期地址是占位符时，先让用户填站点地址
+        if (ShellConfig.needsSetup(this)) promptSiteUrl(null)
+        webView.loadUrl(consumeOpenUrl(intent) ?: ShellConfig.get(this))
         ensurePushService()
     }
 
@@ -196,7 +222,79 @@ class MainActivity : AppCompatActivity() {
     private fun consumeOpenUrl(intent: Intent?): String? {
         val target = intent?.getStringExtra(EXTRA_OPEN_URL) ?: return null
         intent.removeExtra(EXTRA_OPEN_URL)
-        return target.takeIf { it.startsWith(SITE_URL) }
+        return target.takeIf { it.startsWith(ShellConfig.get(this)) }
+    }
+
+    /**
+     * 让用户填/改站点地址。needsSetup 时不可取消（占位符地址进不去任何页面），
+     * 其余场景（加载失败）可以取消，当作网络问题处理。
+     */
+    private fun promptSiteUrl(message: String?) {
+        if (siteDialogShowing) return
+        siteDialogShowing = true
+        val input = EditText(this).apply {
+            setText(ShellConfig.get(this@MainActivity))
+            setHint("https://your-site.vercel.app")
+            setSingleLine()
+        }
+        val mustFill = ShellConfig.needsSetup(this)
+        val builder = AlertDialog.Builder(this)
+            .setTitle("小手机站点地址")
+            .setMessage(message ?: "填你自己的 Float 站点地址（https 开头）。壳只是把网页全屏包起来。")
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton("保存并进入") { _, _ ->
+                val typed = input.text.toString().trim()
+                if (!typed.startsWith("http")) {
+                    siteDialogShowing = false
+                    Toast.makeText(this, "请填 https:// 开头的地址", Toast.LENGTH_LONG).show()
+                    promptSiteUrl(message)
+                    return@setPositiveButton
+                }
+                ShellConfig.set(this, typed)
+                siteDialogShowing = false
+                webView.loadUrl(ShellConfig.get(this))
+            }
+        if (!mustFill) {
+            builder.setNegativeButton("取消") { _, _ -> siteDialogShowing = false }
+        }
+        builder.show()
+    }
+
+    /**
+     * 把字节写进公共「下载」目录，返回落盘位置。
+     * API 29+ 走 MediaStore（不需要任何存储权限）；26-28 走 File + WRITE_EXTERNAL_STORAGE。
+     */
+    private fun writeToDownloads(name: String, bytes: ByteArray, mimeType: String): String? {
+        val mime = mimeType.ifBlank { "application/octet-stream" }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+            val written = runCatching {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("打不开写入流")
+                true
+            }.getOrDefault(false)
+            if (!written) {
+                runCatching { contentResolver.delete(uri, null, null) }
+                return null
+            }
+            "${Environment.DIRECTORY_DOWNLOADS}/$name"
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                return null
+            }
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists() && !dir.mkdirs()) return null
+            val file = File(dir, name)
+            file.writeBytes(bytes)
+            file.absolutePath
+        }
     }
 
     private fun ensurePushService() {
@@ -242,6 +340,43 @@ class MainActivity : AppCompatActivity() {
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 )
             }
+        }
+
+        /**
+         * 网页把 Blob 读成 base64 传进来，壳负责落到系统「下载」目录。
+         *
+         * 为什么需要它：壳原来的 DownloadListener 遇到 blob:/data: 直接 return，
+         * 而 float 网页所有导出（备份、草稿、应用包、聊天附件）都走
+         * URL.createObjectURL + <a download>，也就是 blob: —— 结果是壳里点下载
+         * 只闪一下提示，文件从来不曾落盘。
+         */
+        @JavascriptInterface
+        fun saveFile(name: String, base64: String, mimeType: String) {
+            val fileName = name.ifBlank { "float-${System.currentTimeMillis()}" }
+            val payload = base64.substringAfter("base64,", base64)
+            Thread {
+                val saved = runCatching {
+                    writeToDownloads(fileName, Base64.decode(payload, Base64.DEFAULT), mimeType)
+                }.getOrNull()
+                Handler(Looper.getMainLooper()).post {
+                    val msg = if (saved != null) {
+                        "已保存到「下载」：$fileName"
+                    } else {
+                        "保存失败，请在浏览器里打开站点下载"
+                    }
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                }
+            }.start()
+        }
+
+        /** 当前站点地址，网页可以显示给用户看。 */
+        @JavascriptInterface
+        fun getSiteUrl(): String = ShellConfig.get(this@MainActivity)
+
+        /** 网页侧改站点地址（改完需要重新加载页面才生效）。 */
+        @JavascriptInterface
+        fun setSiteUrl(url: String) {
+            ShellConfig.set(this@MainActivity, url)
         }
     }
 }
