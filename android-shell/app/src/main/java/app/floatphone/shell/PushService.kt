@@ -101,11 +101,12 @@ class PushService : Service() {
 
     /** 借 WebView 的登录 Cookie 调站点接口获取连接参数。 */
     private fun fetchConfig(): PushConfig? = runCatching {
-        val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL) ?: return null
+        val base = ShellConfig.get(this)
+        val cookie = CookieManager.getInstance().getCookie(base) ?: return null
 
         fun getJson(path: String): JSONObject? {
             val request = Request.Builder()
-                .url("${MainActivity.SITE_URL}$path")
+                .url("$base$path")
                 .header("Cookie", cookie)
                 .header("Accept", "application/json")
                 .build()
@@ -144,7 +145,7 @@ class PushService : Service() {
                 .toString()
                 .toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
-                .url("${MainActivity.SITE_URL}/api/push/subscribe")
+                .url("${ShellConfig.get(this)}/api/push/subscribe")
                 .header("Cookie", cookie)
                 .post(body)
                 .build()
